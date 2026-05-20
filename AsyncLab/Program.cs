@@ -1,15 +1,15 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Linq;
-using System.Collections.Concurrent;
 
-// =================== Configuração ===================
 const int PBKDF2_ITERATIONS = 50_000;
 const int HASH_BYTES = 32;
 const string CSV_URL = "https://www.gov.br/receitafederal/dados/municipios.csv";
 const string OUT_DIR_NAME = "mun_hash_por_uf";
+const string DIFF_DIR_NAME = "diffs";
 
 string FormatTempo(long ms)
 {
@@ -21,15 +21,70 @@ var sw = Stopwatch.StartNew();
 
 string baseDir = Directory.GetCurrentDirectory();
 string tempCsvPath = Path.Combine(baseDir, "municipios.csv");
+string newCsvPath = Path.Combine(baseDir, "municipios_novo.csv");
 string outRoot = Path.Combine(baseDir, OUT_DIR_NAME);
+string diffRoot = Path.Combine(baseDir, DIFF_DIR_NAME);
+
+Directory.CreateDirectory(outRoot);
+Directory.CreateDirectory(diffRoot);
 
 Console.WriteLine("Baixando CSV de municípios (Receita Federal) ...");
 
 using (var httpClient = new HttpClient())
 {
     var bytes = await httpClient.GetByteArrayAsync(CSV_URL);
-    await File.WriteAllBytesAsync(tempCsvPath, bytes);
+    await File.WriteAllBytesAsync(newCsvPath, bytes);
 }
+
+if (File.Exists(tempCsvPath))
+{
+    Console.WriteLine("Comparando arquivo local com novo arquivo baixado...");
+
+    var linhasLocais = await File.ReadAllLinesAsync(tempCsvPath, Encoding.UTF8);
+    var linhasNovas = await File.ReadAllLinesAsync(newCsvPath, Encoding.UTF8);
+
+    var localSet = new HashSet<string>(linhasLocais);
+    var novoSet = new HashSet<string>(linhasNovas);
+
+    var adicionadas = novoSet.Except(localSet).ToList();
+    var removidas = localSet.Except(novoSet).ToList();
+
+    if (adicionadas.Count > 0 || removidas.Count > 0)
+    {
+        string diffPath = Path.Combine(
+            diffRoot,
+            $"diff_{DateTime.Now:yyyyMMdd_HHmmss}.txt"
+        );
+
+        var sb = new StringBuilder();
+
+        foreach (var linha in adicionadas)
+        {
+            sb.AppendLine("[ADICIONADO]");
+            sb.AppendLine(linha);
+            sb.AppendLine();
+        }
+
+        foreach (var linha in removidas)
+        {
+            sb.AppendLine("[REMOVIDO]");
+            sb.AppendLine(linha);
+            sb.AppendLine();
+        }
+
+        await File.WriteAllTextAsync(diffPath, sb.ToString(), Encoding.UTF8);
+
+        Console.WriteLine($"Diferenças encontradas e salvas em: {diffPath}");
+    }
+    else
+    {
+        Console.WriteLine("Nenhuma diferença encontrada.");
+    }
+
+    File.Delete(tempCsvPath);
+}
+
+File.Move(newCsvPath, tempCsvPath);
 
 Console.WriteLine("Lendo e parseando o CSV ...");
 
@@ -90,8 +145,6 @@ var ufsOrdenadas = porUf.Keys
     .OrderBy(uf => uf, StringComparer.OrdinalIgnoreCase)
     .ToList();
 
-Directory.CreateDirectory(outRoot);
-
 Console.WriteLine("Calculando hash por município e gerando arquivos por UF ...");
 
 foreach (var uf in ufsOrdenadas)
@@ -106,6 +159,8 @@ foreach (var uf in ufsOrdenadas)
     var swUf = Stopwatch.StartNew();
 
     string outPath = Path.Combine(outRoot, $"municipios_hash_{uf}.csv");
+    string jsonPath = Path.Combine(outRoot, $"municipios_hash_{uf}.json");
+    string binPath = Path.Combine(outRoot, $"municipios_hash_{uf}.dat");
 
     var linhasCsv = new ConcurrentBag<string>();
     var listaJson = new ConcurrentBag<object>();
@@ -115,6 +170,7 @@ foreach (var uf in ufsOrdenadas)
     await Parallel.ForEachAsync(listaUf, async (m, ct) =>
     {
         string password = m.ToConcatenatedString();
+
         byte[] salt = Util.BuildSalt(m.Ibge);
 
         string hashHex = Util.DeriveHashHex(
@@ -166,15 +222,13 @@ foreach (var uf in ufsOrdenadas)
 
     await swOut.WriteLineAsync("TOM;IBGE;NomeTOM;NomeIBGE;UF;Hash");
 
-    foreach (var linha in linhasCsv)
+    foreach (var linha in linhasCsv.OrderBy(x => x))
     {
         await swOut.WriteLineAsync(linha);
     }
 
-    string jsonPath = Path.Combine(outRoot, $"municipios_hash_{uf}.json");
-
     var json = JsonSerializer.Serialize(
-        listaJson,
+        listaJson.OrderBy(x => x.ToString()),
         new JsonSerializerOptions
         {
             WriteIndented = true
@@ -183,11 +237,97 @@ foreach (var uf in ufsOrdenadas)
 
     await File.WriteAllTextAsync(jsonPath, json, Encoding.UTF8);
 
+    await using var fsBin = new FileStream(
+        binPath,
+        FileMode.Create
+    );
+
+    await JsonSerializer.SerializeAsync(
+        fsBin,
+        listaJson
+    );
+
     swUf.Stop();
 
     Console.WriteLine(
-        $"UF {uf} concluída. Arquivos gerados: CSV e JSON. Tempo total UF: {FormatTempo(swUf.ElapsedMilliseconds)}"
+        $"UF {uf} concluída. Arquivos CSV, JSON e BIN gerados. Tempo total UF: {FormatTempo(swUf.ElapsedMilliseconds)}"
     );
+}
+
+Console.WriteLine();
+Console.WriteLine("===== PESQUISA =====");
+
+while (true)
+{
+    Console.WriteLine();
+    Console.WriteLine("1 - Pesquisar por UF");
+    Console.WriteLine("2 - Pesquisar por nome");
+    Console.WriteLine("3 - Pesquisar por código IBGE");
+    Console.WriteLine("0 - Sair");
+
+    Console.Write("Escolha: ");
+
+    var opcao = Console.ReadLine();
+
+    if (opcao == "0")
+        break;
+
+    IEnumerable<Municipio> resultado = Enumerable.Empty<Municipio>();
+
+    switch (opcao)
+    {
+        case "1":
+            Console.Write("UF: ");
+            var uf = (Console.ReadLine() ?? "").Trim().ToUpperInvariant();
+
+            resultado = municipios.Where(x =>
+                x.Uf.Equals(uf, StringComparison.OrdinalIgnoreCase));
+
+            break;
+
+        case "2":
+            Console.Write("Nome: ");
+            var nome = (Console.ReadLine() ?? "").Trim();
+
+            resultado = municipios.Where(x =>
+                x.NomePreferido.Contains(
+                    nome,
+                    StringComparison.OrdinalIgnoreCase));
+
+            break;
+
+        case "3":
+            Console.Write("Código IBGE: ");
+            var codigo = (Console.ReadLine() ?? "").Trim();
+
+            resultado = municipios.Where(x =>
+                x.Ibge.Contains(codigo));
+
+            break;
+
+        default:
+            Console.WriteLine("Opção inválida.");
+            continue;
+    }
+
+    var listaResultado = resultado.ToList();
+
+    Console.WriteLine();
+    Console.WriteLine($"Resultados encontrados: {listaResultado.Count}");
+    Console.WriteLine();
+
+    foreach (var m in listaResultado.Take(50))
+    {
+        Console.WriteLine(
+            $"{m.Ibge} | {m.NomePreferido} | {m.Uf}"
+        );
+    }
+
+    if (listaResultado.Count > 50)
+    {
+        Console.WriteLine();
+        Console.WriteLine("Mostrando apenas os primeiros 50 resultados.");
+    }
 }
 
 sw.Stop();
